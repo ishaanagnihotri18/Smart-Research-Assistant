@@ -221,7 +221,7 @@ async def evaluate(data):
 
                 "context_precision": (
                     p.value
-                    if p is not None
+                    if p is not None 
                     else None
                 ),
 
@@ -302,4 +302,4 @@ if __name__ == "__main__":
         evaluate(data)
     )
 
-    print_results(results)
+    print_results(results) 

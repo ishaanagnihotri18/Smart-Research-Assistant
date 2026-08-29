@@ -3,16 +3,26 @@ import hashlib
 import requests
 from bs4 import BeautifulSoup
 from langchain_chroma import Chroma
+from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
-from docx import Document
+from docx import Document as DocxDocument
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 
 
 # Create embedding model
 def create_embeddings():
     return HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+
+# Create cross-encoder reranker
+def create_reranker():
+    return CrossEncoder(
+        "cross-encoder/ms-marco-MiniLM-L-6-v2"
     )
 
 
@@ -51,9 +61,10 @@ def extract_text_from_txt(txt_file):
         "page": 1
     }]
 
+
 # Extract text from DOCX
 def extract_text_from_docx(docx_file):
-    document = Document(docx_file)
+    document = DocxDocument(docx_file)
 
     text = "\n".join(
         paragraph.text
@@ -166,31 +177,187 @@ def create_vector_store(
     )
 
 
-# Search across multiple documents
+# Create BM25 documents for a source
+def create_bm25_documents(chunks, source_name):
+    documents = []
+
+    for chunk in chunks:
+        documents.append(
+            Document(
+                page_content=chunk["text"],
+                metadata={
+                    "page": chunk["page"],
+                    "source": source_name
+                }
+            )
+        )
+
+    return documents
+
+
+# Create BM25 index
+def create_bm25_index(documents):
+    tokenized_documents = [
+        document.page_content.lower().split()
+        for document in documents
+    ]
+
+    return BM25Okapi(tokenized_documents)
+
+
+# Retrieve documents using BM25
+def bm25_search(
+    bm25_index,
+    documents,
+    query,
+    top_k=5
+):
+    if not documents:
+        return []
+
+    tokenized_query = query.lower().split()
+
+    scores = bm25_index.get_scores(
+        tokenized_query
+    )
+
+    ranked_indices = sorted(
+        range(len(scores)),
+        key=lambda index: scores[index],
+        reverse=True
+    )
+
+    return [
+        documents[index]
+        for index in ranked_indices[:top_k]
+    ]
+
+
+# Retrieve documents using hybrid retrieval
 def search_multiple_documents(
     vector_stores,
+    bm25_stores,
     query,
-    top_k=3
+    top_k=3,
+    candidate_k=5
 ):
-    all_results = []
+    dense_results = []
+    bm25_results = []
 
+    # Dense vector retrieval
     for vector_store in vector_stores:
 
         results = (
             vector_store
             .similarity_search_with_score(
                 query,
-                k=top_k
+                k=candidate_k
             )
         )
 
-        all_results.extend(results)
+        dense_results.extend(
+            document
+            for document, score in results
+        )
 
-    all_results.sort(
-        key=lambda x: x[1]
+    # BM25 keyword retrieval
+    for bm25_store in bm25_stores:
+
+        results = bm25_search(
+            bm25_store["index"],
+            bm25_store["documents"],
+            query,
+            top_k=candidate_k
+        )
+
+        bm25_results.extend(results)
+
+    # Combine results and remove duplicates
+    combined_documents = {}
+    dense_rankings = {}
+    bm25_rankings = {}
+
+    for rank, document in enumerate(
+        dense_results,
+        start=1
+    ):
+        key = (
+            document.metadata.get("source"),
+            document.metadata.get("page"),
+            document.page_content
+        )
+
+        combined_documents[key] = document
+        dense_rankings[key] = rank
+
+    for rank, document in enumerate(
+        bm25_results,
+        start=1
+    ):
+        key = (
+            document.metadata.get("source"),
+            document.metadata.get("page"),
+            document.page_content
+        )
+
+        combined_documents[key] = document
+        bm25_rankings[key] = rank
+
+    # Reciprocal Rank Fusion
+    hybrid_scores = {}
+
+    for key in combined_documents:
+
+        score = 0
+
+        if key in dense_rankings:
+            score += 1 / (60 + dense_rankings[key])
+
+        if key in bm25_rankings:
+            score += 1 / (60 + bm25_rankings[key])
+
+        hybrid_scores[key] = score
+
+    ranked_documents = sorted(
+        combined_documents.values(),
+        key=lambda document: hybrid_scores[
+            (
+                document.metadata.get("source"),
+                document.metadata.get("page"),
+                document.page_content
+            )
+        ],
+        reverse=True
+    )
+
+    # Return candidates for reranking
+    return ranked_documents[:candidate_k]
+
+
+# Rerank retrieved documents using a cross-encoder
+def rerank_documents(
+    reranker,
+    query,
+    documents,
+    top_k=3
+):
+    if not documents:
+        return []
+
+    pairs = [
+        (query, document.page_content)
+        for document in documents
+    ]
+
+    scores = reranker.predict(pairs)
+
+    ranked_results = sorted(
+        zip(documents, scores),
+        key=lambda item: item[1],
+        reverse=True
     )
 
     return [
         document
-        for document, score in all_results[:top_k]
+        for document, score in ranked_results[:top_k]
     ]

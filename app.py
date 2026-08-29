@@ -7,13 +7,18 @@ from generate import create_llm, generate_answer
 from rag_utils import (
     create_embeddings,
     create_vector_store,
+    create_bm25_documents,
+    create_bm25_index,
+    create_reranker,
     extract_text_from_docx,
     extract_text_from_pdf,
     extract_text_from_txt,
     extract_text_from_web,
+    rerank_documents,
     search_multiple_documents,
     split_text,
 )
+
 
 load_dotenv()
 
@@ -30,6 +35,12 @@ st.set_page_config(
 @st.cache_resource
 def get_embeddings():
     return create_embeddings()
+
+
+# Cache cross-encoder reranker
+@st.cache_resource
+def get_reranker():
+    return create_reranker()
 
 
 # Cache language model
@@ -87,13 +98,15 @@ with st.sidebar:
     st.divider()
 
     st.caption(
-        "Powered by RAG • ChromaDB • Embeddings • LLM"
+        "Powered by RAG • Hybrid Retrieval • Reranking • LLM"
     )
 
 
 # Prepare sources
 sources_to_process = []
 
+
+# Add uploaded files
 if uploaded_files:
 
     for uploaded_file in uploaded_files:
@@ -105,6 +118,7 @@ if uploaded_files:
         })
 
 
+# Add webpage URL
 if web_url.strip():
 
     sources_to_process.append({
@@ -122,18 +136,29 @@ if sources_to_process:
     for source in sources_to_process:
 
         if "file" in source:
+
             source_ids.append(
                 get_file_id(source["file"])
             )
+
         else:
+
             source_ids.append(
                 get_source_id(source["name"])
             )
 
+
+    # Reprocess only when sources change
     if st.session_state.get("source_ids") != source_ids:
 
+        # Clear old data
         st.session_state.pop(
             "vector_stores",
+            None
+        )
+
+        st.session_state.pop(
+            "bm25_stores",
             None
         )
 
@@ -143,10 +168,12 @@ if sources_to_process:
         )
 
         vector_stores = []
+        bm25_stores = []
         documents = []
 
+
         with st.spinner(
-            "Processing documents and web content..."
+            "Processing documents and building retrieval indexes..."
         ):
 
             try:
@@ -156,6 +183,7 @@ if sources_to_process:
                 for source in sources_to_process:
 
                     source_name = source["name"]
+
 
                     # Extract source text
                     if source["type"] == "application/pdf":
@@ -171,7 +199,8 @@ if sources_to_process:
                         )
 
                     elif source["type"] == (
-                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        "application/vnd.openxmlformats-officedocument."
+                        "wordprocessingml.document"
                     ):
 
                         pages = extract_text_from_docx(
@@ -195,6 +224,8 @@ if sources_to_process:
 
                             continue
 
+
+                    # Validate extracted content
                     if not pages:
 
                         st.warning(
@@ -203,6 +234,7 @@ if sources_to_process:
                         )
 
                         continue
+
 
                     # Create chunks
                     chunks = split_text(pages)
@@ -216,16 +248,22 @@ if sources_to_process:
 
                         continue
 
-                    # Create vector store
+
+                    # Generate collection ID
                     if "file" in source:
+
                         collection_id = get_file_id(
                             source["file"]
                         )
+
                     else:
+
                         collection_id = get_source_id(
                             source_name
                         )
 
+
+                    # Create ChromaDB vector store
                     vector_store = create_vector_store(
                         chunks,
                         embedding_model,
@@ -237,6 +275,24 @@ if sources_to_process:
                         vector_store
                     )
 
+
+                    # Create BM25 documents and index
+                    bm25_documents = create_bm25_documents(
+                        chunks,
+                        source_name
+                    )
+
+                    bm25_index = create_bm25_index(
+                        bm25_documents
+                    )
+
+                    bm25_stores.append({
+                        "index": bm25_index,
+                        "documents": bm25_documents
+                    })
+
+
+                    # Store document information
                     documents.append({
                         "name": source_name,
                         "pages": pages,
@@ -244,6 +300,8 @@ if sources_to_process:
                         "type": source["type"]
                     })
 
+
+                # Save processed sources
                 if documents:
 
                     st.session_state.source_ids = (
@@ -252,6 +310,10 @@ if sources_to_process:
 
                     st.session_state.vector_stores = (
                         vector_stores
+                    )
+
+                    st.session_state.bm25_stores = (
+                        bm25_stores
                     )
 
                     st.session_state.documents = (
@@ -263,6 +325,7 @@ if sources_to_process:
                     st.warning(
                         "No readable content was found."
                     )
+
 
             except Exception as e:
 
@@ -277,6 +340,11 @@ elif "vector_stores" in st.session_state:
 
     st.session_state.pop(
         "vector_stores",
+        None
+    )
+
+    st.session_state.pop(
+        "bm25_stores",
         None
     )
 
@@ -298,14 +366,22 @@ if "vector_stores" in st.session_state:
         st.session_state.vector_stores
     )
 
+    bm25_stores = (
+        st.session_state.bm25_stores
+    )
+
     documents = (
         st.session_state.documents
     )
 
+
+    # Success message
     st.success(
         f"📚 {len(documents)} source(s) ready"
     )
 
+
+    # Calculate document statistics
     total_pages = sum(
         len(document["pages"])
         for document in documents
@@ -322,33 +398,38 @@ if "vector_stores" in st.session_state:
         for page in document["pages"]
     )
 
+
     # Show metrics
     col1, col2, col3 = st.columns(3)
 
     with col1:
+
         st.metric(
             "📚 Sources",
             len(documents)
         )
 
     with col2:
+
         st.metric(
             "📑 Pages",
             total_pages
         )
 
     with col3:
+
         st.metric(
             "🧩 Chunks",
             total_chunks
         )
+
 
     st.caption(
         f"🔤 {total_characters:,} characters processed"
     )
 
     st.caption(
-        "✅ Content embeddings are stored in ChromaDB."
+        "✅ Dense and BM25 retrieval indexes are ready."
     )
 
     st.divider()
@@ -360,22 +441,29 @@ if "vector_stores" in st.session_state:
     for document in documents:
 
         if document["type"] == "web":
+
             icon = "🌐"
 
         elif document["type"] == "text/plain":
+
             icon = "📝"
 
         elif document["type"] == (
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
         ):
+
             icon = "📝"
 
         else:
+
             icon = "📄"
+
 
         st.write(
             f"{icon} **{document['name']}**"
         )
+
 
     st.divider()
 
@@ -388,22 +476,38 @@ if "vector_stores" in st.session_state:
         placeholder="e.g. What are the main findings?"
     )
 
+
     if query.strip():
 
         with st.spinner(
-            "Searching sources and generating an answer..."
+            "Retrieving, reranking, and generating an answer..."
         ):
 
             try:
 
-                # Retrieve relevant chunks
-                relevant_chunks = (
+                # Hybrid retrieval:
+                # ChromaDB semantic retrieval + BM25 keyword retrieval
+                candidate_chunks = (
                     search_multiple_documents(
                         vector_stores,
+                        bm25_stores,
                         query,
-                        top_k=3
+                        top_k=3,
+                        candidate_k=8
                     )
                 )
+
+
+                # Cross-encoder reranking
+                reranker = get_reranker()
+
+                relevant_chunks = rerank_documents(
+                    reranker,
+                    query,
+                    candidate_chunks,
+                    top_k=3
+                )
+
 
                 if not relevant_chunks:
 
@@ -413,7 +517,7 @@ if "vector_stores" in st.session_state:
 
                 else:
 
-                    # Generate answer
+                    # Generate answer using final Top-3 chunks
                     llm = create_language_model()
 
                     answer = generate_answer(
@@ -422,6 +526,8 @@ if "vector_stores" in st.session_state:
                         relevant_chunks
                     )
 
+
+                    # Display answer
                     st.subheader("🤖 Answer")
 
                     st.info(answer)
@@ -429,7 +535,7 @@ if "vector_stores" in st.session_state:
                     st.divider()
 
 
-                    # Show sources
+                    # Show supporting sources
                     st.subheader(
                         "📚 Supporting Sources"
                     )
@@ -453,11 +559,13 @@ if "vector_stores" in st.session_state:
                         )
 
                         if source_name not in sources:
+
                             sources[source_name] = set()
 
                         sources[source_name].add(
                             page_number
                         )
+
 
                     for (
                         source_name,
@@ -519,7 +627,9 @@ if "vector_stores" in st.session_state:
                                 index
                                 < len(relevant_chunks)
                             ):
+
                                 st.divider()
+
 
             except Exception as e:
 
@@ -529,7 +639,7 @@ if "vector_stores" in st.session_state:
                 )
 
 
-# Ragas evaluation
+# RAGAS evaluation
 st.divider()
 
 st.subheader("📊 RAG Evaluation")
@@ -540,29 +650,38 @@ st.caption(
 
 col1, col2, col3, col4 = st.columns(4)
 
+
 with col1:
+
     st.metric(
         "Faithfulness",
         "1.00"
     )
 
+
 with col2:
+
     st.metric(
         "Answer Relevancy",
         "0.86"
     )
 
+
 with col3:
+
     st.metric(
         "Context Precision",
         "0.90"
     )
 
+
 with col4:
+
     st.metric(
         "Context Recall",
         "0.80"
     )
+
 
 st.caption(
     "Scores obtained from the Ragas evaluation test set."
